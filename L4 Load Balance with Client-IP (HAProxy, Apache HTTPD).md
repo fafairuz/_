@@ -1,3 +1,4 @@
+# SSL via PROXY Protocol
 ## Introduction
 This is a short notes on creating TCP Load Balancer using HAProxy and get the client IP from backend server (Apache HTTPD) and forward it to Application Server.
 
@@ -94,7 +95,7 @@ Important part is that,
 
 > Configuration `ssl-server-verify none` is assuming HAProxy trust 1000% backend server. For more secure, do ssl-verify with certificate from backend server. Basically like SSL-Pinning on mobile app. But each time renew certificate, this cert MUST also be replaced with new one, matching backend cert.
 
-> Cert. Not key.
+> Cert. Not key. Refer to: https://owasp.org/www-community/controls/Certificate_and_Public_Key_Pinning
 
 ## Setting up Apache HTTPD @192.168.232.130
 
@@ -144,10 +145,159 @@ This is standard VirtualHost binding 443 with SSL, except for these parameters:
 2. `RemoteIPTrustedProxy 192.168.232.129/32` ensuring that this Apache HTTPD will trust proxy connection from that specific IP addresses.
 3. `LogFormat "%h %{X-Forwarded-For}i %l ...`. Eventhough this is standard, but we will use this for testing to see if it working or not. %h is for Remote IP address (Client IP address) and X-Forwarded-For is for... X-Forwarded-For.
 
-If you go directly to the server now, you will get error
+## Result #1
+
+If you go directly to the server now (https://192.168.232.130), you will get error
 
 ![](https://i.imgur.com/1fXT7Dk.png)
 
-As explained before, browser is expecting SSL handshake, but 192.168.232.130:443 now instructed to use PROXY protocol.
+As explained before, browser is expecting SSL handshake, but 192.168.232.130:443 now configured to use PROXY protocol. Not even log shows anything.
+
+Now, if we go directly to HAProxy from client, we will get:
+![](https://i.imgur.com/DqY7bvE.png)
+
+If we look at error log,
+![](https://i.imgur.com/UdxoKU1.png)
+Nice!
+
+To check what happens if we "telnet" directly to 192.168.232.130:443 (our Apache HTTPD server),
+![](https://i.imgur.com/7lkUoyz.png)
+Of course, openssl expecting SSL handshake at the beginning.
+
+Now if we "telnet" to our HAProxy Server 192.168.232.129:443, we will get,
+![](https://i.imgur.com/iE9wRib.png)
+which is also nice. 
+
+Client 192.168.232.1 -- SSL --> 192.168.232.129:443 -- PROXY + SSL --> 192.168.232.130:443.
+
+# Add another spice: ProxyPass
+
+This is pretty straight forward. Now that Apache HTTPD will treat Client IP captured from HAProxy, as its own Client IP, it will easily forward Client IP using X-Forwarded-For.
+
+At the client computer (192.168.232.1), just create a simple python file to serve HTTP and print all headers they got. Or you can use anything that will do the same job.
+
+```
+#!/usr/bin/env python3
+
+import http.server as SimpleHTTPServer
+import socketserver as SocketServer
+import logging
+
+PORT = 8000
+
+class GetHandler(
+        SimpleHTTPServer.SimpleHTTPRequestHandler
+        ):
+
+    def do_GET(self):
+        logging.error(self.headers)
+        SimpleHTTPServer.SimpleHTTPRequestHandler.do_GET(self)
 
 
+Handler = GetHandler
+# run as root/administrator to bind to all IP 0.0.0.0
+httpd = SocketServer.TCPServer(("0.0.0.0", PORT), Handler)
+
+httpd.serve_forever()
+```
+
+And add a ProxyPass/ProxyPassReverse for reverse proxy setup at Apache HTTPD.
+
+```
+# Anywhere inside VirtualHost
+        ProxyPass               "/test/" "http://192.168.232.1:8000/"
+        ProxyPassReverse        "/test/" "http://192.168.232.1:8000/"
+```
+
+![](https://i.imgur.com/bd2FieX.png)
+
+Nice. Backend Application will receive Client IP from `X-Forwarded-For`. `X-Forwarded-Host` is where the Client IP access it and `X-Forwarded-Server` is the relaying proxy (can safely ignore this).
+> Forget about ERROR:root from python since we don't do anything on root.
+
+# More spice: Apache HTTPD High Availability (active-active).
+
+For this setup, i will just create a duplicate default-ssl.conf at Apache HTTPD server to serve port 444.
+
+```
+<IfModule mod_ssl.c>
+        <VirtualHost _default_:444>
+                ServerAdmin webmaster@localhost
+
+                RemoteIPProxyProtocol On
+                RemoteIPTrustedProxy 192.168.232.129/32
+
+                DocumentRoot /var/www/html
+
+                LogFormat "%h %{X-Forwarded-For}i %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"" combined
+
+                ErrorLog ${APACHE_LOG_DIR}/error.log
+                CustomLog ${APACHE_LOG_DIR}/ssl-access-444.log combined
+
+                SSLEngine on
+                SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem
+                SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+
+                <FilesMatch "\.(cgi|shtml|phtml|php)$">
+                                SSLOptions +StdEnvVars
+                </FilesMatch>
+                <Directory /usr/lib/cgi-bin>
+                                SSLOptions +StdEnvVars
+                </Directory>
+        </VirtualHost>
+</IfModule>
+```
+Just change port `VirtualHost:443` to `VirtualHost:444` and change custom log to `ssl-access-444.log`.
+
+As for HAProxy server, it is as easy as add another line to backend section. (refer to last line).
+```
+## ^ other config
+backend be_app
+         mode tcp
+
+         server server_01_443  192.168.232.130:443 check check-ssl send-proxy-v2
+         server server_01_444  192.168.232.130:444 check check-ssl send-proxy-v2
+         # ^ not this comment. but this one ^
+```
+
+`curl` from client computer multiple time, we will get this (notice the short time between curl and the alternating log between `ssl-access.log` and `ssl-access-444.log`)
+![](https://i.imgur.com/R2ZvAm1.png)
+
+# Final Form: Active-Active with IP Persist
+
+![](https://i.imgur.com/6ykHDVO.png)
+
+Well i'm not going to explain High Availability for HAProxy setup in here (hint hint: keepalived or pacemaker or LVS). But instead, we are going to apply active-active configuration **WITH** IP Persist for the backend server.
+
+Using active-active without IP Persist is highly recomended to distribute load fairly between backend servers and highly recomended for security reason (you need to launch big DDOS campaign from multiple source to take down whole cluster of backend server).
+
+But then again, this is important for some project when Apache HTTPD requires same client IP to go to same instance (caching/local persist/authentication).
+
+What needed to do is add these two lines in backend section of HAProxy. There's a lot of ways to it like checking cookies etc. But persist by IP is far more easier and compatible with L4 and L7 mode (persist by cookies only works at L7 balancing).
+
+```
+backend be_uap
+         mode tcp
+
+         stick-table type ip size 1m expire 30s
+         stick on src
+
+         server server_01_443  192.168.232.130:443 check check-ssl send-proxy-v2
+         server server_01_444  192.168.232.130:444 check check-ssl send-proxy-v2
+```
+
+This will,
++ `stick-table` use stick table
++ `type ip` using IP for
++ `size 1m` store up to 1 millions of record
++ `expire 30s` each sticky will expire in 30s. choosing which backend will go next depends on the algorithm (in this default case, round robin).
+
+![](https://i.imgur.com/LMYYym9.png)
+
+Here as you can see:
+1. 192.168.232.1 goes to 443
+2. 192.168.232.130 goes to 444 (round robin)
+3. 192.168.232.1 goes to 443 (sticky)
+4. 192.168.232.129 goes to 444 (round robin)
+5. 192.168.232.130 goes to 443 (round robin (prev record .130 expired))
+
+One final note though, make sure IP Sticky expiry matchup with backend persist expiry (like cookies, etc). Let say if cookies at Apache HTTPD expired after 1 hour, it's a good way to matchup expiry in HAProxy 60m (assuming HAProxy -> Apache HTTPD transported in ms of course).
